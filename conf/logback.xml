@@ -28,13 +28,16 @@
   </appender>
 
   <appender name="ASYNCSTDOUT" class="ch.qos.logback.classic.AsyncAppender">
+    <queueSize>8192</queueSize>
+    <neverBlock>true</neverBlock>
     <appender-ref ref="STDOUT" />
   </appender>
 
   <logger name="play" level="INFO" />
   <logger name="application" level="DEBUG" />
+  <logger name="akka" level="INFO" />
 
-  <root level="WARN">
+  <root level="INFO">
     <!--<appender-ref ref="ASYNCFILE" />-->
     <appender-ref ref="ASYNCSTDOUT" />
   </root>

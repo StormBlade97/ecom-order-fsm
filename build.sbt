@@ -1,3 +1,4 @@
+
 name := """ros-state-management"""
 organization := "connected-retail"
 
@@ -9,11 +10,16 @@ scalaVersion := "2.13.1"
 
 libraryDependencies += guice
 libraryDependencies += "org.scalatestplus.play" %% "scalatestplus-play" % "5.0.0" % Test
+libraryDependencies += "com.typesafe.akka" %% "akka-actor-typed" % "2.6.5"
 libraryDependencies += "com.typesafe.akka" %% "akka-actor-testkit-typed" % "2.6.5" % Test
+libraryDependencies += "com.typesafe.akka" %% "akka-protobuf-v3" % "2.6.5"
+libraryDependencies += "com.typesafe.akka" %% "akka-stream" % "2.6.5"
+libraryDependencies += "com.chuusai" %% "shapeless" % "2.3.3"
+libraryDependencies += "com.typesafe.akka" %% "akka-persistence-typed" % "2.6.5"
+libraryDependencies += "org.mockito" % "mockito-all" % "2.0.0-beta" % Test
 
 
-// Adds additional packages into Twirl
-//TwirlKeys.templateImports += "connected-retail.controllers._"
+scalacOptions in Compile ++= Seq("-deprecation", "-feature", "-unchecked", "-Xlog-reflective-calls", "-Xlint")
 
-// Adds additional packages into conf/routes
-// play.sbt.routes.RoutesKeys.routesImport += "connected-retail.binders._"
+// show full stack traces and test case durations
+testOptions in Test += Tests.Argument("-oDF")
