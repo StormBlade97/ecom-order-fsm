@@ -17,6 +17,9 @@ libraryDependencies += "com.typesafe.akka" %% "akka-stream" % "2.6.5"
 libraryDependencies += "com.chuusai" %% "shapeless" % "2.3.3"
 libraryDependencies += "com.typesafe.akka" %% "akka-persistence-typed" % "2.6.5"
 libraryDependencies += "org.mockito" % "mockito-all" % "2.0.0-beta" % Test
+libraryDependencies += "com.typesafe.play" %% "play-json-joda" % "2.8.1"
+libraryDependencies += "com.typesafe.akka" %% "akka-stream-typed" % "2.6.5"
+
 
 
 scalacOptions in Compile ++= Seq("-deprecation", "-feature", "-unchecked", "-Xlog-reflective-calls", "-Xlint")

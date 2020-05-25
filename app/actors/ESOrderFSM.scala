@@ -6,12 +6,12 @@ import akka.actor.typed.{ActorRef, Behavior, SupervisorStrategy}
 import akka.persistence.typed.PersistenceId
 import model.{CancelledOrder, CompletedOrder, FulfillingOrder, InitialOrder, InvalidOrder, Order}
 import org.joda.time.DateTime
-import akka.persistence.typed.scaladsl.{Effect, EventSourcedBehavior, RetentionCriteria}
-import shapeless.Generic
-import akka.actor.typed.scaladsl.{AbstractBehavior, ActorContext, Behaviors}
+import akka.persistence.typed.scaladsl.{Effect, EventSourcedBehavior}
+import akka.actor.typed.scaladsl.Behaviors
+import jobs.ExportStream
 import services.CarrerIntegrator
 
-import scala.concurrent.Future
+import scala.concurrent.duration._
 import scala.util.{Failure, Success}
 
 object ESOrderFSM {
@@ -21,6 +21,8 @@ object ESOrderFSM {
   sealed trait Command {
     val replyTo: ActorRef[OperationResult]
   }
+
+  final case class Initialize(replyTo: Requester, order: Order) extends Command
 
   final case class AssignStore(replyTo: Requester, storeId: String) extends Command
 
@@ -51,6 +53,8 @@ object ESOrderFSM {
 
   sealed trait Event
 
+  final case class ReceivedOrder(order: Order) extends Event
+
   final case class FulfillerAssigned(storeId: String) extends Event
 
   final case class OrderReadied(at: DateTime, labelsUrl: URL) extends Event
@@ -61,9 +65,10 @@ object ESOrderFSM {
 
   final case class OrderCancelled(at: DateTime, by: String, reason: String) extends Event
 
-  sealed trait State {
-    val order: Order
-  }
+  sealed trait State
+
+  // Represents the state where no order is bound to this FSM
+  final case object Empty extends State
 
   final case class Initial(order: InitialOrder) extends State
 
@@ -75,63 +80,109 @@ object ESOrderFSM {
 
   final case class Invalid(order: InvalidOrder) extends State
 
+  def apply(orderId: String, carrerIntegrator: CarrerIntegrator, exportStream: ExportStream): Behavior[Command] = Behaviors.setup { ctx ⇒
+    def persistThenExport(evt: Event) = Effect.persist(evt)
+                                              .thenRun((newState: State) ⇒
+                                                exportStream.getSource() ! (evt → newState)
+                                              )
 
-  def apply(order: InitialOrder, carrerIntegrator: CarrerIntegrator): Behavior[Command] = Behaviors.setup { ctx ⇒
     EventSourcedBehavior.withEnforcedReplies[Command, Event, State](
-      persistenceId = PersistenceId.ofUniqueId(order.id),
-      emptyState = Initial(order),
+      persistenceId = PersistenceId.ofUniqueId(orderId),
+      emptyState = Empty,
       commandHandler = (state, cmd) =>
         state match {
-          case Initial(InitialOrder(id, _, _)) ⇒
-            ctx.log.info("Order is in state INITIAL")
+          case Empty ⇒
+            ctx.log.info(s"Actor started for order ${orderId}")
+            cmd match {
+              case Initialize(replyTo, order) ⇒ persistThenExport(ReceivedOrder(order)).thenReply(replyTo) {
+                case Initial(order) ⇒ Accepted(order)
+                case Fulfilling(order) ⇒ Accepted(order)
+                case Cancelled(order) ⇒ Accepted(order)
+                case Completed(order) ⇒ Accepted(order)
+                case Invalid(order) ⇒ Accepted(order)
+              }
+              case anyCommand ⇒ Effect.reply(anyCommand.replyTo)(Rejected("Operation not supported in state Empty"))
+            }
+          case Initial(initOrder@InitialOrder(_, id, _, _)) ⇒
             cmd match {
               case AssignStore(replyTo, storeId) => Effect.persist(FulfillerAssigned(storeId))
                                                           .thenRun((_: State) ⇒
                                                             ctx.pipeToSelf(carrerIntegrator.generateDeliveryLabel(id, storeId)) {
-                                                              case Success(labelsUrl) ⇒ ReceiveDeliveryDocuments(ctx.system.ignoreRef, labelsUrl)
-                                                              case Failure(error) ⇒ UnableToGetDeliveryDocuments(ctx.system.ignoreRef, error)
+                                                              case Success(labelsUrl) ⇒ ReceiveDeliveryDocuments(replyTo, labelsUrl)
+                                                              case Failure(error) ⇒ UnableToGetDeliveryDocuments(replyTo, error)
                                                             }
                                                           )
-                                                          .thenReply(replyTo)(newState => Accepted(newState.order))
-              case ReceiveDeliveryDocuments(_, labelsUrl) => Effect.persist(OrderReadied(DateTime.now, labelsUrl)).thenNoReply()
-              case UnableToGetDeliveryDocuments(_, reason) => Effect.persist(OrderInvalidated(DateTime.now, reason.getMessage)).thenNoReply()
-              case QueryState(replyTo) ⇒ Effect.reply(replyTo)(Accepted(state.order))
+                                                          .thenReply(exportStream.getSource())((newState: State) ⇒
+                                                            FulfillerAssigned(storeId) → newState
+                                                          )
+              case ReceiveDeliveryDocuments(replyTo, labelsUrl) => persistThenExport(OrderReadied(DateTime.now, labelsUrl))
+                .thenReply(replyTo) {
+                  case Fulfilling(newOrder) ⇒ Accepted(newOrder)
+                }
+              case UnableToGetDeliveryDocuments(replyTo, reason) => persistThenExport(OrderInvalidated(DateTime.now, reason.getMessage))
+                .thenReply(replyTo) {
+                  case Invalid(newOrder) ⇒
+                    ctx.log.warn(s"Could not generate delivery doc for order ${newOrder.id}. Transition to Invalid")
+                    Accepted(newOrder)
+                }
+              case QueryState(replyTo) ⇒ Effect.reply(replyTo)(Accepted(initOrder))
               case anyCommand => Effect.reply(anyCommand.replyTo) {
                 Rejected(s"The command is not permitted while order is in state INITIAL")
               }
             }
-          case Fulfilling(_) =>
-            ctx.log.info("Order is in state FULFILLING")
+          case Fulfilling(fulfillingOrder) =>
             cmd match {
-              case Complete(replyTo, at, by) => Effect.persist(OrderCompleted(at, by))
-                                                      .thenReply(replyTo)(newState => Accepted(newState.order))
-              case CancelOrder(replyTo, at, by, reason) => Effect.persist(OrderCancelled(at, by, reason))
-                                                                 .thenReply(replyTo)(newState => Accepted(newState.order))
-              case QueryState(replyTo) ⇒ Effect.reply(replyTo)(Accepted(state.order))
+              case Complete(replyTo, at, by) => persistThenExport(OrderCompleted(at, by))
+                .thenReply(replyTo) {
+                  case Completed(newOrder) ⇒ Accepted(newOrder)
+                }
+              case CancelOrder(replyTo, at, by, reason) => persistThenExport(OrderCancelled(at, by, reason))
+                .thenReply(replyTo) {
+                  case Cancelled(newOrder) ⇒ Accepted(newOrder)
+                }
+              case QueryState(replyTo) ⇒ Effect.reply(replyTo)(Accepted(fulfillingOrder))
               case anyCommand => Effect.reply(anyCommand.replyTo) {
                 Rejected(s"The command is not permitted while order is in state FULFILLING")
               }
             }
-          case Completed(_) =>
-            ctx.log.info("Order is in state COMPLETED")
+          case Completed(completedOrder) =>
             cmd match {
-              case QueryState(replyTo) ⇒ Effect.reply(replyTo)(Accepted(state.order))
+              case QueryState(replyTo) ⇒ Effect.reply(replyTo)(Accepted(completedOrder))
               case anyCommand => Effect.reply(anyCommand.replyTo) {
                 Rejected(s"The command is not permitted while order is in state COMPLETED")
               }
             }
-          case Cancelled(_) =>
-            ctx.log.info("Order is in state CANCELLED")
-            Effect.stop().thenNoReply()
-          case Invalid(_) =>
-            ctx.log.info("Order is in state INVALID")
-            Effect.stop().thenNoReply()
+          case Cancelled(cancelledOrder) =>
+            cmd match {
+              case QueryState(replyTo) ⇒ Effect.reply(replyTo)(Accepted(cancelledOrder))
+              case anyCommand => Effect.reply(anyCommand.replyTo) {
+                Rejected(s"The command is not permitted while order is in state CANCELLED")
+              }
+            }
+          case Invalid(invalidOrder) =>
+            cmd match {
+              case QueryState(replyTo) ⇒ Effect.reply(replyTo)(Accepted(invalidOrder))
+              case anyCommand => Effect.reply(anyCommand.replyTo) {
+                Rejected(s"The command is not permitted while order is in state CANCELLED")
+              }
+            }
         }
       ,
       eventHandler = (state, evt) => state match {
+        case Empty ⇒ evt match {
+          case ReceivedOrder(order) ⇒ order match {
+            case o: InitialOrder ⇒ Initial(order = o)
+            case o: FulfillingOrder ⇒ ctx.log.info("Arrr"); Fulfilling(order = o)
+            case o: CancelledOrder ⇒ ctx.log.info("Arrr12"); Cancelled(order = o)
+            case o: InvalidOrder ⇒ Invalid(order = o)
+          }
+        }
         case Initial(initialOrder) => evt match {
-          case FulfillerAssigned(storeId) => Initial(initialOrder.copy(storeId = Some(storeId)))
+          case FulfillerAssigned(storeId) =>
+            ctx.log.info(s"Transiting into state Initial from Initial, due to event $evt")
+            Initial(initialOrder.copy(storeId = Some(storeId)))
           case OrderReadied(_, labelsUrl) =>
+            ctx.log.info(s"Transiting into state Fulfilling from Initial, due to event $evt")
             Fulfilling(
               FulfillingOrder(
                 initialOrder.id,
@@ -141,34 +192,42 @@ object ESOrderFSM {
               )
             )
           case OrderInvalidated(_, reason) ⇒ Invalid(
-           InvalidOrder(
-             initialOrder.id,
-             initialOrder.createdAt,
-             initialOrder.storeId.getOrElse("Undefined"),
-             reason
-           )
+            InvalidOrder(
+              initialOrder.id,
+              initialOrder.createdAt,
+              initialOrder.storeId.getOrElse("Undefined"),
+              reason
+            )
           )
           case _ => throw new IllegalStateException(s"unexpected event [$evt] in state [$state]")
         }
         case Fulfilling(fulfillingOrder) => evt match {
-          case _: OrderCompleted => Completed(
-            Generic[CompletedOrder].from(
-              Generic[FulfillingOrder].to(fulfillingOrder) :+ DateTime.now
+          case OrderCompleted(at, _) => Completed(
+            CompletedOrder(
+              fulfillingOrder.id,
+              fulfillingOrder.createdAt,
+              fulfillingOrder.storeId,
+              fulfillingOrder.labelsUrl,
+              at
             )
           )
-          case OrderCancelled(_, _, reason) => Cancelled(
-            Generic[CancelledOrder].from(
-              Generic[FulfillingOrder].to(fulfillingOrder) :+ DateTime.now :+ reason
+          case OrderCancelled(at, _, reason) => Cancelled(
+            CancelledOrder(
+              fulfillingOrder.id,
+              fulfillingOrder.createdAt,
+              fulfillingOrder.storeId,
+              fulfillingOrder.labelsUrl,
+              at,
+              reason
             )
           )
-
-
           case _ => throw new IllegalStateException(s"unexpected event [$evt] in state [$state]"
           )
         }
         case otherStates ⇒ otherStates
       }
-    )
+    ).onPersistFailure(
+      SupervisorStrategy.restartWithBackoff(minBackoff = 10.seconds, maxBackoff = 60.seconds, randomFactor = 0.1))
   }
 }
 
